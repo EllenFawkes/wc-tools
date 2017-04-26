@@ -1,0 +1,11 @@
+#!/bin/bash
+
+if [ $# -lt 1 ]; then
+	echo "Usage: ${0} <[user@]host[:port]>"
+	exit 1
+fi
+
+mkfifo /tmp/shark
+sudo wireshark -k -i /tmp/shark &
+ssh ${1} "tcpdump -s0 -U -n -w - -i bond0 'not port 22'" > /tmp/shark
+rm /tmp/shark

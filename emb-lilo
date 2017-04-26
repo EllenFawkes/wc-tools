@@ -1,0 +1,119 @@
+#!/bin/bash
+#
+#	Copyright 2014 Jan Filip Chadima <jfch@jagda.eu>
+#		All Rights Reserved.
+#
+
+#------------------------------------------------------------------------
+#   Permission to use, copy, modify, and distribute this software for
+#   any purpose with or without fee is hereby granted, provided that
+#   the above copyright notice and this permission notice appear in all
+#   copies.
+#
+#   THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
+#   WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+#   IN NO EVENT SHALL THE AUTHORS AND COPYRIGHT HOLDERS AND THEIR
+#   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+#   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+#   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+#   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+#   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+#   SUCH DAMAGE.
+#------------------------------------------------------------------------
+
+MNT=/tmp/emb$$
+
+if [ "${1}" = -vg ]
+then
+	shift
+	VG="${1}"
+	shift
+fi
+
+DISK="${1}"
+if [ -z "${DISK}" ]
+then
+	echo "Use: $0 [ -vg vg ] disk"
+	exit 1
+fi
+
+if [ -z "${VG:-}" ]
+then
+	MY_ETC="$(cat /proc/mounts | sed -n 's|/dev/mapper/\([A-Za-z0-9_]*\)-etc /etc-rw .*$|\1|p')"
+	VG="$((cd /dev/mapper; ls -1 *-etc) | sed 's/-etc//' | grep -v "^$MY_ETC\$")"
+fi
+
+echo "Creating boot on $DISK, $VG"
+echo
+
+trap "" 1 2 3 15
+
+vgchange -ay "$VG"
+udevadm settle --timeout=30
+
+mkdir -p "${MNT}"
+mount -r /dev/mapper/"${VG}"-rootfs "${MNT}"
+mount /dev/mapper/"${VG}"-etc "${MNT}"/etc
+mount /dev/"${DISK}"1 "${MNT}"/boot
+
+if [ -r "${MNT}/etc/lilo.conf" ]
+then
+	if ! grep -q "root[ 	]*=[ 	]*/dev/mapper/$VG-rootfs" "${MNT}/etc/lilo.conf"
+	then
+		echo "Inconsistent volume group in lilo.conf"
+		umount "${MNT}"/boot
+		umount "${MNT}"/etc
+		umount "${MNT}"
+		rmdir "${MNT}"
+		exit 1	
+	fi
+else
+	if ! grep -q " root=/dev/mapper/$VG-rootfs" "${MNT}/boot/grub/grub.cfg"
+	then
+		echo "Inconsistent volume group in grub.cfg"
+		umount "${MNT}"/boot
+		umount "${MNT}"/etc
+		umount "${MNT}"
+		rmdir "${MNT}"
+		exit 1	
+	fi
+fi
+
+[ ! -f "${MNT}"/boot/vmlinuz ] && ( cd "${MNT}"/boot; rm -f vmlinuz; ln -sf vmlinuz-* vmlinuz )
+[ ! -f "${MNT}"/boot/vmlinuz.old ] && ( cd "${MNT}"/boot; rm -f vmlinuz.old; cp -af vmlinuz vmlinuz.old )
+[ ! -f "${MNT}"/boot/initrd.gz ] && ( cd "${MNT}"/boot; rm -f initrd.gz; ln -sf initrd-* initrd.gz )
+[ ! -f "${MNT}"/boot/initrd.old.gz ] && (cd "${MNT}"/boot; rm -f initrd.old.gz; cp -af initrd.gz initrd.old.gz )
+mount /dev/mapper/"${VG}"-var "${MNT}"/var
+mount /dev/mapper/"${VG}"-root "${MNT}"/tmp
+mount --bind /proc "${MNT}"/proc
+mount --bind /dev "${MNT}"/dev
+mount --bind /sys "${MNT}"/sys
+
+if [ -r "${MNT}"/etc/lilo.conf ]
+then
+	sed -i "s|^boot[ 	]*=.*|boot = /dev/${DISK}|" "${MNT}"/etc/lilo.conf
+	lilo -r "${MNT}"
+	sed -i "s|^boot[ 	]*=.*|boot = /dev/sda|" "${MNT}"/etc/lilo.conf
+else
+	/usr/sbin/grub-install --force --no-floppy --boot-directory "${MNT}"/boot /dev/"${DISK}"
+fi
+
+umount "${MNT}"/boot
+umount "${MNT}"/dev
+umount "${MNT}"/etc
+umount "${MNT}"/var
+umount "${MNT}"/tmp
+umount "${MNT}"/proc
+umount "${MNT}"/sys
+umount "${MNT}"
+rmdir "${MNT}"
+
+vgchange -an "$VG"
+sync
+sleep 3
+
+echo "OK"
+exit 0

@@ -1,0 +1,417 @@
+#!/bin/bash
+#
+#	Copyright 2014-2016 Jan Filip Chadima <jfch@jagda.eu>
+#		All Rights Reserved.
+#
+
+#------------------------------------------------------------------------
+#   Permission to use, copy, modify, and distribute this software for
+#   any purpose with or without fee is hereby granted, provided that
+#   the above copyright notice and this permission notice appear in all
+#   copies.
+#
+#   THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
+#   WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+#   IN NO EVENT SHALL THE AUTHORS AND COPYRIGHT HOLDERS AND THEIR
+#   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+#   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+#   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+#   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+#   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+#   SUCH DAMAGE.
+#------------------------------------------------------------------------
+
+set -eu
+
+help() {
+	echo "Use: $0 [ options ] disk project"
+	echo "	Disk is the disk name w/o /dev aka sda"
+	echo "	Project is the project-name-version part of the file names"
+	echo "	valid options are:"
+	echo "		-boot size	size of the boot partition"
+	echo "		-etc size	size of the etc.rw volume"
+	echo "		-extra size	size of the 2nd partition aka extra (if used)"
+	echo "		-opt size	size of the opt volume (if it is r/w one)"
+	echo "		-root size	size of the root's home volume"
+	echo "		-rootfs size	size of the / volume (if it is r/w one)"
+	echo "		-var size	size of the var volume"
+	echo "		-vg name	name of created volume group"
+	echo "		-dosboot	the boot partition is dos type (loadlin)"
+	echo "		-ext2		use ext2 format for the r/w partitions"
+	echo "		-ext4		use ext4 format for the r/w partitions"
+#-force
+	exit 0
+}
+
+bad_parameter() {
+	echo "Use: $0 -help for the help" >&2
+	exit 1
+}
+
+while echo $1 | grep -q ^- ; do
+	case "$1" in
+		-help)
+			help
+			;;
+		-boot)
+			shift
+			BOOT_SIZE="${1:-}"
+			;;
+		-etc)
+			shift
+			ETC_SIZE="${1:-}"
+			;;
+		-extra)
+			shift
+			EXTRA_SIZE="${1:-}"
+			;;
+		-opt)
+			shift
+			OPT_SIZE="${1:-}"
+			;;
+		-root)
+			shift
+			ROOT_SIZE="${1:-}"
+			;;
+		-rootfs)
+			shift
+			ROOTFS_SIZE="${1:-}"
+			;;
+		-var)
+			shift
+			VAR_SIZE="${1:-}"
+			;;
+		-vg)
+			shift
+			VG="${1:-}"
+			;;
+		-dosboot)
+			DOSBOOT="t\n1\n6\n"
+			;;
+		-ext2)
+			EXT=ext2
+			;;
+		-ext4)
+			EXT=ext4
+			;;
+#		-force)
+#			FORCE=1
+#			;;
+		*)
+			bad_parameter
+	esac
+	shift
+done
+
+DISK="${1:-}"
+PROJNAME="${2:-}"
+
+if [ -z "$DISK" -o -z "$PROJNAME" ] ; then
+	bad_parameter
+fi
+
+MNT=/tmp/emb$$
+
+if [ -r "$PROJNAME".set ] ; then
+	PROJECT=$(sed -n 's/^PROJECT=//p' "$PROJNAME".set)
+	VERSION=$(sed -n 's/^VERSION=//p' "$PROJNAME".set)
+	TAG=$(sed -n 's/^TAG=//p' "$PROJNAME".set) || true
+else
+	echo "File $PROJNAME.set is not readable." >&2
+	false
+fi
+
+if [ -n "$TAG" ] ; then
+	VERSION="$VERSION"-"$TAG"
+fi
+
+if [ "$PROJECT"-"$VERSION" != "$PROJNAME" ] ; then
+	echo "Inconsistent $PROJNAME.set file." >&2
+	false
+fi
+
+[ -z "${BOOT_SIZE:-}" ] && BOOT_SIZE=$(sed -n 's/X_BOOT_SIZE=//p' "$PROJNAME".set)
+[ -z "${ETC_SIZE:-}" ] && ETC_SIZE=$(sed -n 's/X_ETC_SIZE=//p' "$PROJNAME".set)
+[ -z "${OPT_SIZE:-}" ] && ETC_SIZE=$(sed -n 's/X_OPT_SIZE=//p' "$PROJNAME".set)
+[ -z "${ROOT_SIZE:-}" ] && ROOT_SIZE=$(sed -n 's/X_ROOT_SIZE=//p' "$PROJNAME".set)
+[ -z "${ROOTFS_SIZE:-}" ] && ROOTFS_SIZE=$(sed -n 's/X_ROOTFS_SIZE=//p' "$PROJNAME".set)
+[ -z "${VAR_SIZE:-}" ] && VAR_SIZE=$(sed -n 's/X_VAR_SIZE=//p' "$PROJNAME".set)
+[ -z "${EXTRA_SIZE:-}" ] && EXTRA_SIZE=$(sed -n 's/X_EXTRA_SIZE=//p' "$PROJNAME".set)
+[ -z "${VG:-}" ] && VG=$(sed -n 's/X_VG=//p' "$PROJNAME".set)
+[ -z "${EXT:-}" ] && grep -q '^X_FSTYPE=ext2$' "$PROJNAME".set && EXT=ext2
+[ -z "${EXT:-}" ] && grep -q '^X_FSTYPE=ext4$' "$PROJNAME".set && EXT=ext4
+[ -z "${DOSBOOT:-}" ] && grep -q '^X_DOSBOOT=..*' "$PROJNAME".set && DOSBOOT="t\n1\n6\n"
+
+[ -z "${BOOT_SIZE:-}" ] && BOOT_SIZE=64
+[ -z "${ETC_SIZE:-}" ] && ETC_SIZE=128
+[ -z "${OPT_SIZE:-}" ] && OPT_SIZE=1024
+[ -z "${ROOT_SIZE:-}" ] && ROOT_SIZE=64
+[ -z "${ROOTFS_SIZE:-}" ] && ROOTFS_SIZE=2048
+[ -z "${VAR_SIZE:-}" ] && VAR_SIZE=512
+[ -z "${EXTRA_SIZE:-}" ] && EXTRA_SIZE=0
+[ -z "${VG:-}" ] && VG=emb_vg
+[ -z "${EXT:-}" ] && EXT=4
+
+if [ -r "$PROJECT"-rootfs-"$VERSION".squashfs ] ; then
+	ROOTFSIMG="$PROJECT"-rootfs-"$VERSION".squashfs
+	ROOTFSRW=
+elif [ -r "$PROJECT"-"$VERSION"-rootfs.squashfs ] ; then
+	ROOTFSIMG="$PROJECT"-"$VERSION"-rootfs.squashfs
+	ROOTFSRW=
+elif [ -r "$PROJECT"-rootfs-"$VERSION".txz ] ; then
+	ROOTFSIMG="$PROJECT"-rootfs-"$VERSION".txz
+	ROOTFSRW=Y
+elif [ -r "$PROJECT"-"$VERSION"-rootfs.txz ] ; then
+	ROOTFSIMG="$PROJECT"-"$VERSION"-rootfs.txz
+	ROOTFSRW=Y
+else
+	echo "Missing rootfs." >&2
+	false
+fi
+
+if [ -r "$PROJECT"-boot-"$VERSION".txz ] ; then
+	BOOTIMG="$PROJECT"-boot-"$VERSION".txz
+elif [ -r "$PROJECT"-"$VERSION"-boot ] ; then
+	BOOTIMG="$PROJECT"-"$VERSION"-boot
+else
+	echo "Missing boot" >&2
+	false
+fi
+
+if [ -r "$PROJECT"-etc.rw-"$VERSION".txz ] ; then
+	ETCRWIMG="$PROJECT"-etc.rw-"$VERSION".txz
+elif [ -r "$PROJECT"-"$VERSION"-etc.rw ] ; then
+	ETCRWIMG="$PROJECT"-"$VERSION"-etc.rw
+else
+	ETCRWIMG=
+fi
+
+if [ -n "$ETCRWIMG" ] ; then
+	VG0="$(tar -OxJf "$ETCRWIMG" ./lilo.conf 2>/dev/null | sed -n 's|^[ 	]*root[ 	]*=[ 	]*/dev/mapper/\([A-Za-z0-9_]*\)-rootfs$|\1|p' | head -n 1)"
+elif [ -n "ROOTFSRW" ] ; then
+	VG0="$(tar -OxJf "$ROOTFSIMG" ./etc/lilo.conf 2>/dev/null | sed -n 's|^[ 	]*root[ 	]*=[ 	]*/dev/mapper/\([A-Za-z0-9_]*\)-rootfs$|\1|p' | head -n 1)"
+fi
+
+if [ -z "${VG0:-}" -a -n "$BOOTIMG" ] ; then
+	VG0="$(tar -OxJf "$BOTTTIMG" ./grub/grub.cfg 2>/dev/null | sed -n 's|^[ 	]*linux[ 	].*root=/dev/mapper/\([A-Za-z0-9_]*\)-rootfs .*$|\1|p' | head -n 1)"
+fi
+
+if [ -z "$VG0" ] ; then
+	echo "Cannot find image volume group"
+	false
+fi
+
+if grep -wq /dev/mapper/$VG-rootfs /proc/mounts ; then
+	echo "Volume group $VG is in conflict with the system one."
+	false
+fi
+
+lvs -o +devices | awk "/\/dev\/$DISK/{print \$2}" | sort -u | while read VGX ; do
+	vgchange -an "$VGX"
+done	
+
+if lvscan | grep -q "ACTIVE.*'/dev/$VG/" ; then
+	vgchange -an "$VG"
+fi
+
+if [ "$VG" != "$VG0" ] ; then
+	echo "Will rename volume group from $VG0 to $VG."
+fi
+
+newlv()
+{
+	lvcreate -Z n -L "$2" -n "$1" "$VG"	> /dev/null
+	udevadm settle --timeout=30
+}
+
+newfs()
+{
+	echo	"newfs $1 -> $2"
+	set +e
+	MKMSG="$(mkfs.${3:-$EXT} "/dev/$1" 2>&1 >/dev/null)"
+	if [ $? -ne 0 ] ; then
+		echo $MKMSG
+		exit 1
+	fi
+	set -e
+	if [ -z "${3:-}" ] ; then
+		tune2fs -L "$2" "/dev/$1"		> /dev/null
+		tune2fs -c 16000 "/dev/$1"		> /dev/null
+		tune2fs -i 10000 "/dev/$1"		> /dev/null
+		tune2fs -e continue "/dev/$1"		> /dev/null
+	else
+		fatlabel "/dev/$1" "$2"			> /dev/null
+	fi
+}
+
+copy()
+{
+	echo "copy $2"
+	mount "/dev/$1" "$MNT"
+	unxz < "$2" | (cd "$MNT"; tar xf -)
+	umount "$MNT"
+}
+
+squashfs()
+{
+	echo "copy $1"
+	local SIZE=$(du -k "$1" | cut -f1)
+	SIZE=$(expr $SIZE + 1)
+	newlv "$2" "${SIZE}k"
+	set +e
+	DDMSG="$(dd if="$1" "of=/dev/mapper/$VG-$2" bs=4M 2>&1)"
+	if [ $? -ne 0 ] ; then
+	        echo "$DDMSG"
+	        exit 1
+	else
+	        echo "$DDMSG" | sed -n 's/\(.* bytes .*copied, .*\)/  \1/p'
+	fi
+	set -e
+}
+
+echo "Creating $VG on /dev/$DISK"
+echo "From $PROJNAME"
+echo
+
+sleep 5
+
+trap "" 1 2 3 15
+trap 'set +e; cd; umount "$MNT"; rmdir "$MNT"; vgchange -an "$VG"' EXIT
+mkdir -p "$MNT"
+
+#[ ${FORCE:-0} -ne 1 ] || dd if=/dev/zero of=/dev/"$DISK" bs=128M
+
+set +e
+if [ $EXTRA_SIZE -eq 0 ] ; then
+	FDMSG="$(echo -e "o\nn\np\n1\n\n+${BOOT_SIZE}M\n${DOSBOOT:-}a\n1\nn\np\n4\n\n\nt\n4\n8e\nw" | fdisk "/dev/$DISK" 2>&1)"
+	RV=$?
+else
+	FDMSG="$(echo -e "o\nn\np\n1\n\n+${BOOT_SIZE}M\n${DOSBOOT:-}a\n1\nn\np\n2\n\n+${EXTRA_SIZE}M\nn\np\n4\n\n\nt\n4\n8e\nw" | fdisk "/dev/$DISK" 2>&1)"
+	RV=$?
+fi
+set -e
+if [ $RV -ne 0 ] ; then
+	echo "$FDMSG" | sed -n '/WARNING/,$p'
+	exit 1
+fi
+
+fdisk -l "/dev/$DISK" | sed '1,/^$/d'
+
+set +e
+PVMSG="$(pvcreate -ff -y "/dev/${DISK}4" 2>&1)"
+if [ $? -ne 0 ] ; then
+	echo $PVMSG
+	exit 1
+fi
+VGMSG="$(vgcreate "$VG" "/dev/${DISK}4" 2>&1)"
+if [ $? -ne 0 ] ; then
+	echo $VGMSG
+	exit 1
+fi
+set -e
+
+vgchange -ay "$VG" >/dev/null 2>&1 || true
+
+if [ -z "$ROOTFSRW" ] ; then
+	squashfs "$ROOTFSIMG" rootfs
+else
+	newlv rootfs "${ROOTFS_SIZE}M"
+	newfs "mapper/$VG-rootfs" rootfs
+	copy "mapper/$VG-rootfs" "$ROOTFSIMG"
+fi
+
+if [ -n "${DOSBOOT:-}" ] ; then
+	newfs "${DISK}1" boot_$VG fat
+else
+	newfs "${DISK}1" boot_$VG
+fi
+copy "${DISK}1" "$BOOTIMG"
+
+if [ -n "$ETCRWIMG" ] ; then
+	newlv etc "${ETC_SIZE}M"
+	newfs "mapper/$VG-etc" etc
+	copy "mapper/$VG-etc" "$ETCRWIMG"
+fi
+
+if [ -r "$PROJECT"-opt-"$VERSION".squashfs ] ; then
+	squashfs "$PROJECT"-opt-"$VERSION".squashfs opt
+elif [ -r "$PROJECT"-"$VERSION"-rootfs.squashfs ] ; then
+	squashfs "$PROJECT"-"$VERSION"-opt.squashfs opt
+elif [ -r "$PROJECT"-rootfs-"$VERSION".txz ] ; then
+	newlv opt "${OPT_SIZE}M"
+	newfs "mapper/$VG-opt" opt
+	copy "mapper/$VG-opt" "$PROJECT"-opt-"$VERSION".txz
+elif [ -r "$PROJECT"-"$VERSION"-rootfs.txz ] ; then
+	newlv opt "${OPT_SIZE}M"
+	newfs "mapper/$VG-opt" opt
+	copy "mapper/$VG-opt" "$PROJECT"-"$VERSION"-opt.txz
+fi
+
+if [ -r "$PROJECT"-var-"$VERSION".txz ] ; then
+	newlv var "${VAR_SIZE}M"
+	newfs "mapper/$VG-var" var
+	copy "mapper/$VG-var" "$PROJECT"-var-"$VERSION".txz
+elif [ -r "$PROJECT"-"$VERSION"-var.txz ] ; then
+	newlv var "${VAR_SIZE}M"
+	newfs "mapper/$VG-var" var
+	copy "mapper/$VG-var" "$PROJECT"-"$VERSION"-var.txz
+fi
+
+if [ -r "$PROJECT"-root-"$VERSION".txz ] ; then
+	newlv root "${ROOT_SIZE}M"
+	newfs "mapper/$VG-root" root
+	copy "mapper/$VG-root" "$PROJECT"-root-"$VERSION".txz
+elif [ -r "$PROJECT"-"$VERSION"-root.txz ] ; then
+	newlv root "${ROOT_SIZE}M"
+	newfs "mapper/$VG-root" root
+	copy "mapper/$VG-root" "$PROJECT"-"$VERSION"-root.txz
+fi
+
+grep '^X_ADDITIONAL_*._SIZE=' "${PROJNAME}.set" | while read addline
+do
+	echo "$addline" | sed 's/^X_ADDITIONAL_\(*.\)_SIZE=/\1 /' | ( read name size
+		newlv "$name" "${size}M"
+		newfs "mapper/$VG-$name" "$name"
+		if [ -r "$PROJECT"-"$name"-"$VERSION".txz ] ; then
+			copy "mapper/$VG-$name" "$PROJECT"-"$name"-"$VERSION".txz
+		elif [ -r "$PROJECT"-"$VERSION"-"$name".txz ] ; then
+			copy "mapper/$VG-$name" "$PROJECT"-"$VERSION"-"$name".txz
+		fi	
+	)
+done
+
+if [ $EXTRA_SIZE -ne 0 ] ; then
+	newfs "${DISK}2" extra_$VG
+fi
+
+if [ "$VG" != "$VG0" ] ; then
+	if [ -n "$ETCRWIMG" ] ; then
+		mount /dev/mapper/$VG-etc /mnt
+		[ -w /mnt/lilo.conf ] && sed -i "s|\(^[ 	]*root[ 	]*=[ 	]*/dev/mapper/\)$VG0\(-.*\)|\1$VG\2|" /mnt/lilo.conf
+		[ -w /mnt/fstab ] && sed -i "s|/dev/mapper/$VG0-|/dev/mapper/$VG-|" /mnt/fstab
+		[ -w /mnt/fstab ] && sed -i "s|=boot_$VG0-|=boot_$VG-|" /mnt/fstab
+		umount /mnt
+	elif [ -n "$ROOTFSRW" ] ; then
+		mount /dev/mapper/$VG-rootfs /mnt
+		[ -w /mnt/etc/lilo.conf ] && sed -i "s|\(^[ 	]*root[ 	]*=[ 	]*/dev/mapper/\)$VG0\(-rootfs\)$|\1$VG\2|" /mnt/etc/lilo.conf
+		[ -w /mnt/etc/fstab ] && sed -i "s|/dev/mapper/$VG0-|/dev/mapper/$VG-|" /mnt/etc/fstab
+		umount /mnt
+	fi
+	mount /dev/"${DISK}1" /mnt
+	[ -w /mnt/grub/grub.conf ] && sed -i "s|\(^[ 	]*root[ 	]*=[ 	]*/dev/mapper/\)$VG0\(-.*\)|\1$VG\2|" /mnt/grub/grub.conf
+	umount /mnt
+fi
+
+rmdir "$MNT"
+
+vgchange -an "$VG" >/dev/null 2>&1 || true
+trap '' EXIT
+
+[ -n "${DOSBOOT:-}" ] || emb-lilo -vg "$VG" "$DISK"
+
+
+echo "OK"
+exit 0

@@ -1,0 +1,262 @@
+#!/bin/bash
+#
+#	Copyright 2014-2016 Jan Filip Chadima <jfch@jagda.eu>
+#		All Rights Reserved.
+#
+
+#------------------------------------------------------------------------
+#   Permission to use, copy, modify, and distribute this software for
+#   any purpose with or without fee is hereby granted, provided that
+#   the above copyright notice and this permission notice appear in all
+#   copies.
+#
+#   THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
+#   WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+#   IN NO EVENT SHALL THE AUTHORS AND COPYRIGHT HOLDERS AND THEIR
+#   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+#   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+#   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+#   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+#   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+#   SUCH DAMAGE.
+#------------------------------------------------------------------------
+
+set -e
+set -u
+
+TMP=/tmp
+MANUAL=
+TEST=
+VERBOSE=
+OPT_N=
+OPT_R=
+OPT_D=
+VAR=
+
+help()
+{
+	echo "Use $0 [-t tmpdir] [-T] [-v] [-m cmd] [-svar out_var] [-{input|-} output [{+|-}{d|n|r} package ...]"
+	exit 1
+}
+
+while echo X$1 | grep -q ^X- ; do
+	case "$1" in
+		"-T")
+			TEST=1
+			shift
+			;;
+		"-svar")
+			VAR="$2"
+			shift 2
+			;;
+		"-v")
+			VERBOSE=1
+			shift
+			;;
+		"-t")
+			TMP="$(realpath -eq "${2:-}")"
+			shift 2
+			;;
+		"-m")
+			MANUAL="$2"
+			shift 2
+			;;
+		*)
+			help
+			exit 1
+	esac
+done
+
+if [ -z "${2:-}" ]
+then
+	help
+fi
+
+if [ "$1" = - ] ; then
+	SOURCE=/dev/mapper/*-rootfs
+else
+	SOURCE="$(realpath -eq "$1")"
+fi
+OUTPUT="$(realpath -mq "$2")"
+CWD=$(pwd)
+
+shift 2
+
+TMPDIR="$TMP"/emb-patch"$$"
+
+trap "rm -rf $TMPDIR" EXIT
+
+mkdir "$TMPDIR"
+cd "$TMPDIR"
+
+if ! unsquashfs $SOURCE ; then
+	rm -rf "$TMPDIR"
+	echo "Space overflow"
+	exit 1
+fi
+
+cd squashfs-root
+
+mv etc etc.ORIGINAL
+mv etc.ro etc
+
+NPATCH=$(cat .EMB-version | wc -l)
+
+cd var
+mkdir adm
+cd adm
+ln -s ../../usr/adm/* .
+cd ../../usr/adm
+mkdir -p patches
+touch patches/$NPATCH.log
+cd ../..
+
+#mkdir log
+#cd log
+#ln -s ../../usr/share/install/* .
+#cd ../..
+
+SIG="Updated $(date '+%F %T') to: $(basename "$OUTPUT") patch# $NPATCH"
+
+if [ -n "$MANUAL" ] ; then
+	$MANUAL
+	echo "<* $(echo "$MANUAL" | tr -d \'\") *>" >> usr/adm/patches/$NPATCH.log
+fi
+
+echo ""
+
+for i in $*
+do
+	case "$i" in
+		"+d")
+			OPT_D=--delete
+			echo "<DELETE>" >> usr/adm/patches/$NPATCH.log
+			;;
+		"-d")
+			OPT_D=
+			echo "</DELETE>" >> usr/adm/patches/$NPATCH.log
+			;;
+		"+n")
+			OPT_N=--install-new
+			echo "<NEW>" >> usr/adm/patches/$NPATCH.log
+			;;
+		"-n")
+			OPT_N=
+			echo "</NEW>" >> usr/adm/patches/$NPATCH.log
+			;;
+		"+r")
+			OPT_R=--reinstall
+			echo "<REINSTALL>" >> usr/adm/patches/$NPATCH.log
+			;;
+		"-r")
+			OPT_R=
+			echo "</REINSTALL>" >> usr/adm/patches/$NPATCH.log
+			;;
+		*)
+			if [ -n "$OPT_D" ] ; then
+				ROOT=. removepkg "$i"
+				echo "$i"  >> usr/adm/patches/$NPATCH.log
+			else
+				cd "$CWD"
+				PAR="$(realpath "$i")"
+				cd - >/dev/null
+				if ECHO=$(ROOT=. upgradepkg $OPT_N $OPT_R "$PAR" 2>&1) ; then
+					BASE="$(basename "$i")"
+					echo "$BASE"  >> usr/adm/patches/$NPATCH.log
+					if [ -n "$VERBOSE" ] ; then
+						echo "$ECHO"
+					else
+						echo "$BASE"
+					fi
+				fi
+			fi
+			;;
+	esac
+done
+
+mount --bind /dev "$TMPDIR"/squashfs-root/dev
+
+ldconfig -N -r "$TMPDIR"/squashfs-root
+ldconfig -X -r "$TMPDIR"/squashfs-root || true
+
+SAVED_PATH=$PATH
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:$TMPDIR/squashfs-root/sbin:$TMPDIR/squashfs-root/usr/sbin:$TMPDIR/squashfs-root/bin:$TMPDIR/squashfs-root/usr/bin
+
+if [ -d "$TMPDIR"/squashfs-root/usr/man ] ; then
+	makewhatis "$TMPDIR"/squashfs-root/usr/man
+fi
+
+fc-cache -f
+
+for theme_dir in "$TMPDIR"/squashfs-root/usr/share/icons/* ; do
+	gtk-update-icon-cache -t -f $theme_dir
+done
+
+if [ -d "$TMPDIR"/squashfs-root/usr/share/mime ]; then
+	update-mime-database "$TMPDIR"/squashfs-root/usr/share/mime
+fi
+
+if [ -x "$TMPDIR"/squashfs-root/usr/bin/update-gtk-immodules ]; then
+	chroot "$TMPDIR"/squashfs-root update-gtk-immodules
+fi
+
+if [ -x "$TMPDIR"/squashfs-root/usr/bin/update-gdk-pixbuf-loaders ]; then
+	chroot "$TMPDIR"/squashfs-root update-gdk-pixbuf-loaders
+fi
+
+if [ -x "$TMPDIR"/squashfs-root/usr/bin/update-pango-querymodules ]; then
+	chroot "$TMPDIR"/squashfs-root update-pango-querymodules
+fi
+
+if [ -x "$TMPDIR"/squashfs-root/usr/bin/glib-compile-schemas ]; then
+	chroot "$TMPDIR"/squashfs-root glib-compile-schemas /usr/share/glib-2.0/schemas
+fi
+
+PATH=$SAVED_PATH
+
+if [ -n "$VAR" ] ; then
+	VAR="$(realpath -qm "$VAR")"
+	(cd var
+		tar cvfJ "$VAR" *
+	)
+fi
+
+rm -rf var/* boot/*
+
+[ -e etc/rc.d/rc.S ] && cp -a etc/rc.d/rc.S etc.ORIGINAL/rc.d/rc.S
+[ -e etc/inittab ] && cp -a etc/inittab etc.ORIGINAL/
+
+mv etc etc.ro
+mv etc.ORIGINAL etc
+
+echo "$SIG" >> .EMB-version
+
+umount "$TMPDIR"/squashfs-root/dev
+
+rm -f "$OUTPUT"
+mkdir -p "$(dirname "$OUTPUT")"
+mksquashfs . "$OUTPUT"
+
+if [ -n "$TEST" ] ; then
+	echo ""
+	echo "testing"
+
+	find "." | while read FILE
+	do
+		if file "${FILE}" | grep -e "executable" -e "shared object" | grep -q ELF
+		then
+			if chroot . /usr/bin/ldd ${FILE} 2>/dev/null | awk '($2 == "=>" && $3 == "not" && $4 ==  "found"){ if (U[$1] == "" && D[$1] == "") U[$1] = "Y"; next }; ($2 == "=>"){ U[$1] = ""; D[$1] = "Y"}; END{ for(I in U) if (U[I] == "Y") print "	" I " => not found"}' | grep ' => not found' ; then
+				echo "Invalid object: ${FILE}"
+			fi
+		fi
+	done	
+fi
+
+echo ""
+
+cd $CWD
+rm -rf $TMPDIR
+

@@ -1,0 +1,371 @@
+#!/usr/bin/perl -w
+
+# Copyright (c) 2008, Digium, Inc.
+#
+# Author: Terry Wilson <twilson@digium.com>
+#
+# This program is free software, distributed under the terms of
+# the GNU General Public License Version 2. See the LICENSE file
+# at the top of the source tree.
+
+use strict;
+use Net::Pcap;
+use Net::Pcap::Reassemble;
+use NetPacket::Ethernet;
+use NetPacket::IP;
+use NetPacket::UDP;
+use NetPacket::TCP;
+use Net::SIP;
+use Getopt::Std;
+use IO::File;
+use Number::Range;
+
+use constant PACKET_IN => 0;
+use constant PACKET_OUT => 1;
+
+$main::VERSION = 0.01;
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+
+our $opt_a = "";
+our $opt_f;
+our $opt_p = "5060";
+
+getopts('a:f:p:');
+
+our $filetable = {};
+our $callidtable = {};
+our $audio_ports = {};
+our $num_calls = 0;
+
+$opt_p =~ s/-/../g;
+our $port_range = Number::Range->new($opt_p);
+
+our ($cap, $err);
+unless (defined($opt_f)) {
+	my $dev = Net::Pcap::lookupdev(\$err);
+	if (defined $err) {
+		die 'Unable to determine network device for monitroing - ', $err;
+	}
+
+	my ($address, $netmask);
+	if (Net::Pcap::lookupnet($dev, \$address, \$netmask, \$err)) {
+		die "Unable to look up device information for $dev - $err";
+	}
+	
+	$cap = Net::Pcap::open_live($dev, 65535, 0, -1, \$err);
+	my $filter;
+	Net::Pcap::compile($cap, \$filter, 'udp', 0, $netmask);
+	Net::Pcap::setfilter($cap, $filter);
+} else {
+	print "Opening offline file '$opt_f'.\n";
+	$cap = Net::Pcap::open_offline($opt_f, \$err);
+	die $err if defined($err);
+}
+
+$SIG{INT} = sub {
+	Net::Pcap::breakloop($cap);
+};
+
+Net::Pcap::Reassemble::loop($cap, -1, \&pcap_callback, undef);
+
+while (my ($k, $v) = each %$filetable) {
+	print "Wrote scenario file $k.xml\n";
+	end_file($v);
+}
+
+while (my ($k, $v) = each %$audio_ports) {
+	print "Wrote audio file $k.pcap\n";
+	Net::Pcap::dump_flush($v->{file});
+	Net::Pcap::dump_close($v->{file});
+}
+
+sub HELP_MESSAGE {
+	print "Usage: sniff2sipp [-a <IP:PORT>] [-f <capture_file>]\n\n";
+	print "\t-a : The IP:PORT to not generate scenarios for (i.e. Asterisk)\n";
+	print "\t-f : Use <capture_file> to generate scenarios instead of live capture\n";
+	print "\t-p : SIP port ranges to look at in format 5060,5079,6050-6060.\n";
+	print "\t     RTP ports determined from SDP\n\n";
+}
+
+sub pcap_callback {
+	my ($user_data, $header, $packet) = @_;
+	my $data;
+	my $ether_data = NetPacket::Ethernet::strip($packet);
+	my $ip = NetPacket::IP->decode($ether_data);
+	if ($ip->{proto} == NetPacket::IP::IP_PROTO_UDP) {
+		$data = NetPacket::UDP->decode($ip->{data});
+	} elsif ($ip->{proto} == NetPacket::IP::IP_PROTO_TCP) {
+		$data = NetPacket::TCP->decode($ip->{data});
+	} else {
+		return;
+	}
+	my $src_host_port = "$ip->{src_ip}:$data->{src_port}";
+	my $dest_host_port = "$ip->{dest_ip}:$data->{dest_port}";
+	my $sip_pkt;
+	
+	if (exists($audio_ports->{$src_host_port})) {
+
+		unless (exists($audio_ports->{$src_host_port}->{writing})) {
+			$audio_ports->{$src_host_port}->{writing} = 1;
+			if ( exists( $filetable->{ $audio_ports->{$src_host_port}->{scenario} } ) ) {
+				my $file = $filetable->{ $audio_ports->{$src_host_port}->{scenario} };
+				print $file "  <nop>\n";
+				print $file "    <action>\n";
+				print $file "      <exec play_pcap_audio=\"$src_host_port.pcap\"/>\n";
+				print $file "    </action>\n";
+				print $file "  </nop>\n\n";
+				print $file "  <pause />\n\n";
+			}
+		}
+		Net::Pcap::dump($audio_ports->{$src_host_port}->{file}, $header, $packet);
+	}
+	eval {
+		if ($port_range->inrange($data->{src_port}) || $port_range->inrange($data->{dest_port})) {
+			$sip_pkt = Net::SIP::Packet->new($data->{data}) if $data->{data} =~ /^\S+/;
+		}
+	};
+	if (defined($sip_pkt)) {
+		my $envelope = {};
+		$envelope->{src_host_port} = $src_host_port;
+		$envelope->{packet} = $sip_pkt;
+		$filetable->{$src_host_port} = start_file("$src_host_port.xml") unless $src_host_port eq $opt_a || exists($filetable->{$src_host_port});
+		$filetable->{$dest_host_port} = start_file("$dest_host_port.xml") unless $dest_host_port eq $opt_a || exists($filetable->{$dest_host_port});
+		add_packet_to_scenario($envelope, $filetable->{$src_host_port}, PACKET_OUT) unless $src_host_port eq $opt_a;
+		add_packet_to_scenario($envelope, $filetable->{$dest_host_port}, PACKET_IN) unless $dest_host_port eq $opt_a;
+	}
+}
+
+sub start_file {
+	my $filename = shift;
+	local *OUTFILE = IO::File->new("> $filename");
+	print OUTFILE '<?xml version="1.0" encoding="ISO-8859-1" ?>'."\n";
+	print OUTFILE '<!DOCTYPE scenario SYSTEM "sipp.dtd">'."\n\n";
+	print OUTFILE '<scenario name="Generated Scenario for '.$filename.'">'."\n";
+	return *OUTFILE;
+}
+
+sub add_packet_to_scenario {
+	my ($envelope, $file, $direction) = @_;
+	my $sip_packet = $envelope->{packet};
+	my $sip_string = process_packet($envelope);
+	if ($direction == PACKET_OUT) {
+		print $file "  <send" . ($sip_packet->{code} eq 'ACK' ? '>' : ' retrans="500">') . "\n";
+		print $file "    <![CDATA[\n\n";
+		foreach my $line (split(/\r\n/, $sip_string)) {
+			print $file "      $line\n";
+		}
+		print $file "\n    ]]>\n";
+		print $file "  </send>\n\n";
+
+	} else {
+		if ($sip_packet->is_request) {
+			print $file '  <recv request="' . $sip_packet->method . '" crlf="true">' . "\n";
+			print $file "  </recv>\n\n";
+		} else {
+			print $file '  <recv response="'.$sip_packet->code.'"'. ($sip_packet->code =~ /40[17]/ ? ' auth="true"' : '') . '>'."\n";
+			print $file "  </recv>\n\n";
+		}
+	}
+}
+
+sub end_file {
+	my $file = shift;
+	print $file "</scenario>\n";
+	close $file;
+}
+
+sub process_packet {
+	my $envelope = shift;
+	my $packet = $envelope->{packet};
+	my $callid = $packet->get_header('call-id');
+
+	# sipp has to generate its own callids to be able to match, and has a hacky way to deal with calls that
+    # contain multiple calls--adding a ///, so we do that here
+	unless (exists($callidtable->{$callid})) {
+		$num_calls += 1;
+		$callidtable->{$callid}->{scenario_call_id} = $num_calls > 1 ? "$num_calls///[call_id]" : "[call_id]";
+	}	
+
+	# Do all of the substitution necessary for converting a packet to a scenario
+	# this is kind of ugly, but works so far.
+	my $sip_string = $packet->as_string;
+	if ($packet->is_request) {
+		# Fix URI
+		$sip_string = $packet->as_string;
+		$sip_string =~ s/^([A-Za-z]+) ([^:]+):([^@]+\@)?(\S+) SIP\/2\.0/"$1 $2:" . (defined($3) ? "[service]\@" : "") . "[remote_ip]:[remote_port] SIP\/2\.0"/ei;
+		
+		# Fix To
+		$sip_string =~ s/(to):\s*([^:]+):([^@]+)@[^>\s]+/"$1: $2:" . ($packet->method eq "REGISTER" ? $3 : "[service]") . "\@[remote_ip]:[remote_port]"/ei;
+		$sip_string =~ s/(to):(.*);tag=[^;\s]+/$1:$2;tag=[peer_tag_param]/i;
+
+		# Fix Call-ID 
+		$sip_string =~ s/(call-id):\s*(\S+)/"$1: " . $callidtable->{$2}->{scenario_call_id}/ie;
+
+		# Fix Via
+		$sip_string =~ s/(via):\s*(SIP\/2\.0\/[^\s]+)\s[^;]+/$1: $2 [local_ip]:[local_port]/i;
+		$sip_string =~ s/branch=[^;\s]+/branch=[branch]/;
+
+		# Fix From
+		$sip_string =~ s/(from):\s*([^:]+):([^@]+)@[^>\s]+/$1: $2:$3\@[local_ip]:[local_port]/i;
+		$sip_string =~ s/(from):(.*);tag=[^;\s]+/$1:$2;tag=[pid]SIPpTag00[call_number]/i;
+
+		# Fix Contact
+		$sip_string =~ s/(contact):\s*([^:]+):([^@]+)@[^>\s]+/$1: $2:$3\@[local_ip]:[local_port]/i;
+
+		# Fix authorization
+		my $username;
+		if ($sip_string =~ /[A-Za-z]*-?authorization:.*username="([^"]+)"/i) {
+			$username = $1;
+		}
+		if (defined($username)) {
+			$sip_string =~ s/([A-Za-z]*-?authorization):[^\r\n]+/$1: [authentication username=$username]/i;
+		} else {
+			$sip_string =~ s/([A-Za-z]*-?authorization):[^\r\n]+/$1: [authentication]/i;
+		}
+
+		# Fix Content-Length
+		$sip_string =~ s/(content-length):\s*\S+/$1: [len]/i;
+
+		# Fix SDP o=
+		$sip_string =~ s/o=(.*)\sIN IP(\d+)\s\S+/o=$1 IN IP$2 [local_ip]/i;
+
+		# Fix SDP c=
+		my $media_ip = $2 if $sip_string =~ s/c=IN IP(\d+) (\S+)/c=IN IP$1 [media_ip]/i;
+		
+		# FIX SDP m=
+		my $media_port = $1 if $sip_string =~ s/m=audio (\S+)/m=audio [auto_media_port]/i;
+
+		my $media_ip_port = "$media_ip:$media_port" if (defined($media_ip) && defined($media_port));
+
+		if (defined($media_ip_port) && 
+				$media_ip ne "0.0.0.0" && 
+				$envelope->{src_host_port} ne $opt_a &&
+				!exists($audio_ports->{$media_ip_port}))
+		{
+				$audio_ports->{$media_ip_port}->{file} = Net::Pcap::dump_open($cap, "$media_ip_port.pcap");
+				$audio_ports->{$media_ip_port}->{scenario} = $envelope->{src_host_port};
+		}
+	} else { # Packet is a response
+		$sip_string = $packet->as_string;
+		$sip_string =~ s/via:[^\r\n]+/[last_Via:]/i;
+		$sip_string =~ s/from:[^\r\n]+/[last_From:]/i;
+		$sip_string =~ s/to:[^\r\n]+/[last_To:];tag=[pid]SIPpTag01[call_number]/i;
+		$sip_string =~ s/(contact):\s*([^:]+):([^@]+)@[^>\s]+/$1: $2:$3\@[local_ip]:[local_port]/i;
+		$sip_string =~ s/call-id:[^\r\n]+/[last_Call-ID:]/i;
+		$sip_string =~ s/cseq:[^\r\n]+/[last_CSeq:]/i;
+		$sip_string =~ s/(content-length):[^\r\n]+/$1: [len]/i;
+
+		# Fix Content-Length
+		$sip_string =~ s/(content-length):\s*\S+/$1: [len]/i;
+
+		# Fix SDP o=
+		$sip_string =~ s/o=(.*)\sIN IP(\d+)\s\S+/o=$1 IN IP$2 [local_ip]/i;
+
+		# Fix SDP c=
+		my $media_ip = $2 if $sip_string =~ s/c=IN IP(\d+) (\S+)/c=IN IP$1 [media_ip]/i;
+		
+		# FIX SDP m=
+		my $media_port = $1 if $sip_string =~ s/m=audio (\S+)/m=audio [auto_media_port]/i;
+
+		my $media_ip_port = "$media_ip:$media_port" if defined(($media_ip) && defined($media_port));
+
+		if (defined($media_ip_port) && 
+				$media_ip ne "0.0.0.0" && 
+				$envelope->{src_host_port} ne $opt_a &&
+				!exists($audio_ports->{$media_ip_port}))
+		{
+				$audio_ports->{$media_ip_port}->{file} = Net::Pcap::dump_open($cap, "$media_ip_port.pcap");
+				$audio_ports->{$media_ip_port}->{scenario} = $envelope->{src_host_port};
+		}
+	}
+	return $sip_string;
+}
+__END__
+
+=head1 DESCRIPTION
+
+sniff2sipp is a quickly hacked together tool to generate sipp scenarios from
+live pcap (tcpdump, wireshark, etc.) captures or saved  pcap capture files.
+
+=head1 USAGE
+
+sniff2sipp [-a <IP:PORT>] [-f <capture_file>]
+	-a : The IP:PORT to not generate scenarios for (i.e. Asterisk)
+	-f : Use <capture_file> to generate scenarios instead of live capture
+	-p : SIP port ranges to look at in format 5060,5079,6050-6060.
+		RTP ports determined from SDP
+
+For example, if you are interested in generating scenario files for two phones
+communicating through an Asterisk server to one another, and intend on playing
+those scenarios back to the original Asterisk server, then you just need to
+create scenarios for the two phones, not for Asterisk. If Asterisk is listining
+on 192.168.1.1:5060 you would run:
+
+  sniff2sipp -a 192.168.1.1:5060
+
+for a live capture. When you are finished capturing, just hit Cntrl-c. If you
+had already captured the traffic with tcpdump into a file named dump.cap, then
+you would run:
+
+  sniff2sipp -a 192.168.1.1:5060 -f dump.cap
+
+If you wanted to capture traffic on a port other than 5060 (the default port),
+say ports 5060, 5061, and 6060-6069, you could add the port range spefication:
+
+  sniff2sipp -a 192.168.1.1:5060 -f dump.cap -p 5060,5061,6060-6069
+
+=head1 OUTPUT
+
+After running sniff2sipp, scenario files with filenames of "IP:PORT.xml" will
+be created. If sniff2sipp found audio (which it determines by looking at the
+SDP), it will also create a dump of the raw audio in files with filenames of
+"IP:PORT.pcap". The scenario files will be set up to play these pcap files
+when sipp loads them. Currently, sipp does not block while playing a pcap
+audio file, so to prevent it proceeding to the next packet, a pause statement
+is required in the scenario file. sniff2sipp does not currently calculate the
+length of this pause, and instead leaves it up to the user to specify the
+appropriate pause length in milliseconds either by editing the scenario file
+or by using the sipp '-d' command line option.
+
+=head1 USING THE SCENARIOS
+
+Lets say you have a two SIP phones, A and B at 192.168.1.10 and 192.168.1.11
+respectively. They communicate through an Asterisk server at 192.168.1.1:5060
+and, on the Asterisk box you run:
+
+  sniff2sipp -a 192.168.1.1:5060
+
+and then place a call from phone A to phone B. The duration of the call after
+connection is 20 seconds, then you hang up. You then stop sniff2sipp by
+hitting cntrl-c.
+
+After running sniff2sipp you have two scenario files and two audio files
+generated:
+
+  192.168.1.10:2234.xml
+  192.168.1.11:2235.xml
+  192.168.1.10.19784.pcap
+  192.168.1.11.45502.pcap
+
+You can now use sipp to replay the conversation to Asterisk. Your UAC is phone
+A, so if you wanted to execute the scenario a single time you would run:
+
+  sipp -sf 192.168.1.10:2234.xml 192.168.1.1 -d 20000 \
+    -m1 -mi 192.168.1.1 -mp 5555
+
+For phone B, a UAS, you would then run:
+
+  sipp -sf 192.168.1.11:2235.xml -mi 192.168.1.1 -mp 7777
+
+=head2 NOTE
+
+You will want to make sure that Asterisk is running first because, by
+default, sipp will use port 5060 and Asterisk will not be able to bind to it
+if it is in use.
+
+This tool has not been tested much and was written to scratch an itch I had.
+It hasn't been tested very much at all and there are certainly *many*
+improvements that could be made. If it doesn't scratch your particular itch
+then please, by all means, send a patch. It is very much in the state of an
+internally used tool/script and could use all kinds of polishing.

@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [ $# -lt 2 ]; then
+	echo "Usage: ${0} <[user@]host[:port]> <logfile>"
+	exit 1
+fi
+
+ssh ${1} "tail -f /var/log/konos" | tee -a ${2}

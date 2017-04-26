@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -e
+set -u
+
+cd /etc.rw
+find * -type f -print | while read f
+do
+	if diff -N $f /etc.ro/$f > /dev/null
+	then
+		RW="$(ls -ldn "$f" | cut -f1,3,4 -d' ')"
+		RO="$(ls -ldn "/etc.ro/$f" | cut -f1,3,4 -d' ')"
+		if [ "$RW" = "$RO" ]
+		then
+			echo "rm -f $f"
+			rm -f "$f"
+		else
+			echo "perm $f"
+		fi
+	else
+		echo "save $f"
+	fi
+done
+
+echo "OK"
+
