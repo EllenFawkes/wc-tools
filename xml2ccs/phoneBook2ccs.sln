@@ -1,0 +1,26 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 11.00
+# Visual Studio 2010
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "phoneBook2ccs", "phoneBook2ccs\phoneBook2ccs.csproj", "{137D8D14-8CDB-4DE2-B46A-4A0877E1F106}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "speedDials2ccs", "speedDials2ccs\speedDials2ccs.csproj", "{12E9035A-1350-4E9B-B0E6-C800E2091409}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x86 = Debug|x86
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{137D8D14-8CDB-4DE2-B46A-4A0877E1F106}.Debug|x86.ActiveCfg = Debug|x86
+		{137D8D14-8CDB-4DE2-B46A-4A0877E1F106}.Debug|x86.Build.0 = Debug|x86
+		{137D8D14-8CDB-4DE2-B46A-4A0877E1F106}.Release|x86.ActiveCfg = Release|x86
+		{137D8D14-8CDB-4DE2-B46A-4A0877E1F106}.Release|x86.Build.0 = Release|x86
+		{12E9035A-1350-4E9B-B0E6-C800E2091409}.Debug|x86.ActiveCfg = Debug|x86
+		{12E9035A-1350-4E9B-B0E6-C800E2091409}.Debug|x86.Build.0 = Debug|x86
+		{12E9035A-1350-4E9B-B0E6-C800E2091409}.Release|x86.ActiveCfg = Release|x86
+		{12E9035A-1350-4E9B-B0E6-C800E2091409}.Release|x86.Build.0 = Release|x86
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
