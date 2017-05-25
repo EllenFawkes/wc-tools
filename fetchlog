@@ -1,8 +1,19 @@
 #!/bin/bash
 
 if [ $# -lt 2 ]; then
-	echo "Usage: ${0} <[user@]host[:port]> <logfile>"
+	echo "Usage: ${0} <[user@]host[:port]> <logfile> [logtype]"
+	echo "Alowed logtypes:"
+	echo "cez - Communication log from REST API betwen DT and AS"
+	echo "If you don't specify logtype, then fetch a general logfile (/var/log/konos)"
 	exit 1
 fi
 
-ssh ${1} "tail -f /var/log/konos" | tee -a ${2}
+: ${3:-}
+LOGFILE=/var/log/konos
+
+if [ ${3} == "cez" ]; then
+	LOGFILE=/var/log/vaf/konosbox-AS_CEZ.log 
+fi
+
+echo "Logfile: $LOGFILE"
+ssh ${1} "tail -f ${LOGFILE}" | tee -a ${2}
